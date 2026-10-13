@@ -1,0 +1,182 @@
+name: Release WA Pulse
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Git tag from wa-pulse repo (e.g., v1.0.0)'
+        required: true
+        type: string
+      commit_sha:
+        description: 'Commit SHA from wa-pulse repo'
+        required: true
+        type: string
+      version_name:
+        description: 'Version name (e.g., 1.0.0)'
+        required: true
+        type: string
+      release_notes:
+        description: 'Release notes / changelog'
+        required: false
+        type: string
+
+  repository_dispatch:
+    types: [release_build]
+
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  JAVA_VERSION: '21'
+  GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx4g -XX:+HeapDumpOnOutOfMemoryError"'
+
+jobs:
+  build:
+    name: Build APKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout wa-pulse source
+        uses: actions/checkout@v4
+        with:
+          repository: AltafYafai/WA-Pulse
+          ref: ${{ github.event.inputs.commit_sha || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: wa-pulse
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 35
+          ndk-version: r28c
+          build-tools: 35.0.0
+          cmake-version: 3.22.1
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('wa-pulse/**/*.gradle*', 'wa-pulse/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Make gradlew executable
+        run: chmod +x wa-pulse/gradlew
+
+      - name: Build Release APKs
+        working-directory: wa-pulse
+        run: |
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Rename APKs
+        working-directory: wa-pulse
+        run: |
+          VERSION="${{ github.event.inputs.version_name || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          GIT_HASH="${{ github.event.inputs.commit_sha || github.sha }}"
+          GIT_HASH="${GIT_HASH:0:8}"
+
+          find app/build/outputs/apk -name "*.apk" | while read apk; do
+            if [[ "$apk" == *"business"* ]]; then
+              NEW_NAME="WAPulse-Business-${VERSION} (${GIT_HASH}).apk"
+            else
+              NEW_NAME="WAPulse-${VERSION} (${GIT_HASH}).apk"
+            fi
+            echo "Renaming $apk to $NEW_NAME"
+            cp "$apk" "../${NEW_NAME}"
+          done
+
+      - name: Upload APKs as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apks
+          path: |
+            WAPulse-*.apk
+            WAPulse-Business-*.apk
+          retention-days: 30
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: release-apks
+          path: artifacts
+
+      - name: Prepare release notes
+        id: release_notes
+        run: |
+          VERSION="${{ github.event.inputs.version_name || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          TAG="v${VERSION}"
+          
+          if [[ -n "${{ github.event.inputs.release_notes }}" ]]; then
+            NOTES="${{ github.event.inputs.release_notes }}"
+          elif [[ -f "wa-pulse/changelog.txt" ]]; then
+            NOTES=$(cat wa-pulse/changelog.txt)
+          else
+            NOTES="Release ${TAG}"
+          fi
+          
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_notes.outputs.tag }}
+          name: WA Pulse ${{ steps.release_notes.outputs.tag }}
+          body: ${{ steps.release_notes.outputs.notes }}
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/WAPulse-*.apk
+            artifacts/WAPulse-Business-*.apk
+          generate_release_notes: false
+
+  notify:
+    name: Notify Completion
+    needs: release
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Send Telegram notification (if configured)
+        if: env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != ''
+        run: |
+          STATUS="${{ needs.release.result }}"
+          VERSION="${{ github.event.inputs.version_name || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          
+          if [[ "$STATUS" == "success" ]]; then
+            MESSAGE="✅ WA Pulse ${VERSION} released successfully!"
+          else
+            MESSAGE="❌ WA Pulse ${VERSION} release failed!"
+          fi
+          
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="${MESSAGE}" \
+            -d parse_mode="HTML"
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
