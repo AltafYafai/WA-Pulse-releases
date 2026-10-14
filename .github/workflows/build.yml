@@ -266,9 +266,11 @@ jobs:
 
       - name: Publish Release
         if: success()
-        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+          # The workspace git remote is the private source repo, so the target
+          # repository must always be passed explicitly.
+          TARGET_REPO: ${{ github.repository }}
           PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
           PAYLOAD_VERSION: ${{ github.event.client_payload.version_name }}
           PAYLOAD_NOTES: ${{ github.event.client_payload.release_notes }}
@@ -296,13 +298,14 @@ jobs:
           [ -f "$BIZ_APK" ] && FILES+=("$BIZ_APK")
 
           if [ ${#FILES[@]} -gt 0 ]; then
-            echo "Publishing release $TAG in ${{ github.repository }}..."
-            if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Publishing release $TAG in ${TARGET_REPO}..."
+            if gh release view "$TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
               echo "Release $TAG already exists, updating..."
-              gh release edit "$TAG" --title "$TITLE" --notes "$BODY" --latest
-              gh release upload "$TAG" "${FILES[@]}" --clobber
+              gh release edit "$TAG" --repo "$TARGET_REPO" --title "$TITLE" --notes "$BODY" --latest
+              gh release upload "$TAG" "${FILES[@]}" --repo "$TARGET_REPO" --clobber
             else
               gh release create "$TAG" "${FILES[@]}" \
+                --repo "$TARGET_REPO" \
                 --title "$TITLE" \
                 --notes "$BODY" \
                 --latest
