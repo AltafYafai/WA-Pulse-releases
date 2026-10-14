@@ -1,0 +1,414 @@
+name: Build APKs
+
+# Builds are always executed here (public repo) from the private source repo.
+# The private repo only dispatches: it never runs Gradle.
+on:
+  repository_dispatch:
+    types: [build, release_build]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or commit SHA of AltafYafai/WA-Pulse to build'
+        required: false
+        default: master
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPOSITORY: AltafYafai/WA-Pulse
+  NDK_VERSION: '28.2.13676358'
+  CMAKE_VERSION: '3.22.1'
+
+concurrency:
+  group: build-${{ github.event.client_payload.commit_sha || inputs.ref || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build WaEnhancer APKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Resolve source ref
+        id: src
+        env:
+          PAYLOAD_SHA: ${{ github.event.client_payload.commit_sha }}
+          PAYLOAD_BRANCH: ${{ github.event.client_payload.branch }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          REF="${PAYLOAD_SHA:-${INPUT_REF:-master}}"
+          BRANCH="${PAYLOAD_BRANCH:-$REF}"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Building ${SOURCE_REPOSITORY} @ ${REF}"
+
+      - name: Resolve source credentials
+        id: cred
+        env:
+          PAT: ${{ secrets.PAT || secrets.SOURCE_TOKEN || secrets.GH_PAT }}
+          SSH_KEY: ${{ secrets.SOURCE_SSH_KEY }}
+        run: |
+          if [ -n "$PAT" ]; then
+            echo "auth=token" >> "$GITHUB_OUTPUT"
+            echo "Using PAT secret for the source checkout."
+          elif [ -n "$SSH_KEY" ]; then
+            echo "auth=ssh" >> "$GITHUB_OUTPUT"
+            echo "No PAT secret found, falling back to the read-only deploy key."
+          else
+            echo "::error::No source credential found. Add a repository secret named PAT with read access to ${SOURCE_REPOSITORY}."
+            exit 1
+          fi
+
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ steps.src.outputs.ref }}
+          submodules: recursive
+          fetch-depth: 0
+          # Exactly one credential is passed so the auth mode is never ambiguous.
+          token: ${{ steps.cred.outputs.auth == 'token' && (secrets.PAT || secrets.SOURCE_TOKEN || secrets.GH_PAT) || github.token }}
+          ssh-key: ${{ steps.cred.outputs.auth == 'ssh' && secrets.SOURCE_SSH_KEY || '' }}
+
+      - name: Send Initial Telegram Progress
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
+            COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1 | sed 's/[<>&]//g')
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            TEXT=$(printf "%s\n" \
+              "🔨 <b>WaEnhancer Build Tracker</b>" \
+              "━━━━━━━━━━━━━━━━━━" \
+              "📌 <b>Commit:</b> <code>${SHORT_SHA}</code>" \
+              "💬 <b>Message:</b> ${COMMIT_MSG}" \
+              "🌿 <b>Branch:</b> <code>${{ steps.src.outputs.branch }}</code>" \
+              "" \
+              "<b>Progress:</b>" \
+              "🔄 [1/4] Setting up Java, Android SDK & NDK..." \
+              "⏳ [2/4] Compiling WhatsApp & Business APKs..." \
+              "⏳ [3/4] Uploading APK Artifacts..." \
+              "⏳ [4/4] Delivering APKs to Telegram...")
+            RES=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "text=${TEXT}" \
+              --data-urlencode "parse_mode=HTML")
+            MSG_ID=$(echo "$RES" | grep -o '"message_id":[0-9]*' | head -n 1 | cut -d: -f2)
+            if [ -n "$MSG_ID" ]; then
+              echo "$MSG_ID" > /tmp/tg_msg_id
+            fi
+          fi
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        continue-on-error: true
+        env:
+          ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+        with:
+          cmdline-tools-version: 12266719
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+
+      - name: Setup NDK & CMake
+        run: |
+          # Fix sdkmanager not in PATH after setup-android (Node 20 workaround)
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_HOME/cmdline-tools/latest/bin:/usr/local/lib/android/sdk/cmdline-tools/latest/bin:$PATH"
+          if command -v sdkmanager >/dev/null 2>&1; then
+            yes | sdkmanager --licenses || true
+            sdkmanager "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}" "platforms;android-35" || true
+          else
+            echo "sdkmanager not found in PATH, trying fallback locations..."
+            for p in "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "/usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager" "/opt/android-sdk/cmdline-tools/latest/bin/sdkmanager"; do
+              if [ -x "$p" ]; then
+                echo "Found sdkmanager at $p"
+                yes | "$p" --licenses || true
+                "$p" "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}" "platforms;android-35" || true
+                break
+              fi
+            done
+          fi
+          ls -la "$ANDROID_SDK_ROOT/platforms/" 2>&1 | head -n 20 || true
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Update Progress - Compiling APKs
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ] && [ -f /tmp/tg_msg_id ]; then
+            MSG_ID=$(cat /tmp/tg_msg_id)
+            COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1 | sed 's/[<>&]//g')
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            TEXT=$(printf "%s\n" \
+              "🔨 <b>WaEnhancer Build Tracker</b>" \
+              "━━━━━━━━━━━━━━━━━━" \
+              "📌 <b>Commit:</b> <code>${SHORT_SHA}</code>" \
+              "💬 <b>Message:</b> ${COMMIT_MSG}" \
+              "🌿 <b>Branch:</b> <code>${{ steps.src.outputs.branch }}</code>" \
+              "" \
+              "<b>Progress:</b>" \
+              "✅ [1/4] Environment & Android SDK Ready" \
+              "🔄 [2/4] Compiling WhatsApp & Business APKs with Gradle..." \
+              "⏳ [3/4] Uploading APK Artifacts..." \
+              "⏳ [4/4] Delivering APKs to Telegram...")
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/editMessageText" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "message_id=${MSG_ID}" \
+              --data-urlencode "text=${TEXT}" \
+              --data-urlencode "parse_mode=HTML" > /dev/null || true
+          fi
+
+      - name: Build WhatsApp & Business APKs
+        id: build_apks
+        run: |
+          set -o pipefail
+          ./gradlew assembleWhatsappDebug assembleBusinessDebug -Pminify=true --stacktrace 2>&1 | tee build.log
+
+      - name: Check 16KB native lib alignment (Android 15+)
+        if: success()
+        run: |
+          echo "Checking 16KB alignment for native libs (required for targetSdk 35+)..."
+          echo "NDK version: ${NDK_VERSION}, useLegacyPackaging=false ensures 16KB support"
+          find app/build -name "*.so" -type f 2>/dev/null | head -n 20 || echo "No .so found in build/"
+          for apk in app/build/outputs/apk/whatsapp/debug/*.apk app/build/outputs/apk/business/debug/*.apk; do
+            if [ -f "$apk" ]; then
+              echo "APK: $apk size $(du -h "$apk" | cut -f1)"
+              unzip -l "$apk" 2>/dev/null | grep -E "\.so|libdexkit" | head -n 20 || true
+            fi
+          done
+          echo "16KB check complete"
+
+      - name: Update Progress - Packaging & Uploading
+        if: success()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ] && [ -f /tmp/tg_msg_id ]; then
+            MSG_ID=$(cat /tmp/tg_msg_id)
+            COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1 | sed 's/[<>&]//g')
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            TEXT=$(printf "%s\n" \
+              "🔨 <b>WaEnhancer Build Tracker</b>" \
+              "━━━━━━━━━━━━━━━━━━" \
+              "📌 <b>Commit:</b> <code>${SHORT_SHA}</code>" \
+              "💬 <b>Message:</b> ${COMMIT_MSG}" \
+              "🌿 <b>Branch:</b> <code>${{ steps.src.outputs.branch }}</code>" \
+              "" \
+              "<b>Progress:</b>" \
+              "✅ [1/4] Environment & Android SDK Ready" \
+              "✅ [2/4] WhatsApp & Business APKs Compiled!" \
+              "🔄 [3/4] Uploading Artifacts & Delivering to Telegram..." \
+              "⏳ [4/4] Finalizing...")
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/editMessageText" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "message_id=${MSG_ID}" \
+              --data-urlencode "text=${TEXT}" \
+              --data-urlencode "parse_mode=HTML" > /dev/null || true
+          fi
+
+      - name: Prepare Error Log on Failure
+        if: failure()
+        run: |
+          echo "=== BUILD FAILURE DIAGNOSTICS ===" > error.log
+          echo "Source: ${SOURCE_REPOSITORY} @ ${{ steps.src.outputs.ref }}" >> error.log
+          echo "Commit: ${{ github.event.client_payload.commit_sha || github.sha }}" >> error.log
+          echo "Triggered by: ${{ github.actor }}" >> error.log
+          echo "Event: ${{ github.event_name }}" >> error.log
+          echo "" >> error.log
+          if [ -f build.log ]; then
+            echo "=== LAST 250 LINES OF BUILD LOG ===" >> error.log
+            tail -n 250 build.log >> error.log
+          else
+            echo "No build.log found." >> error.log
+          fi
+
+      - name: Upload WhatsApp APK Artifact
+        id: upload_wa
+        if: success()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: WAPulse-APK
+          path: app/build/outputs/apk/whatsapp/debug/*.apk
+          retention-days: 7
+
+      - name: Upload Business APK Artifact
+        id: upload_biz
+        if: success()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: WAPulse-Business-APK
+          path: app/build/outputs/apk/business/debug/*.apk
+          retention-days: 7
+
+      - name: Upload Error Log Artifact
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-error-log
+          path: error.log
+          retention-days: 7
+
+      - name: Publish Release
+        if: success()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
+          PAYLOAD_VERSION: ${{ github.event.client_payload.version_name }}
+          PAYLOAD_NOTES: ${{ github.event.client_payload.release_notes }}
+        run: |
+          VERSION=$(grep -oP 'versionName\s*=\s*"\K[^ "]+' app/build.gradle.kts | head -n 1)
+          SHORT_SHA=$(git rev-parse --short=8 HEAD | tr '[:lower:]' '[:upper:]')
+
+          if [ -n "$PAYLOAD_TAG" ]; then
+            TAG="$PAYLOAD_TAG"
+            TITLE="WA Pulse ${PAYLOAD_TAG}"
+            BODY="${PAYLOAD_NOTES:-Automated release ${PAYLOAD_TAG}}"
+          else
+            TAG="v${VERSION}-${SHORT_SHA}"
+            TITLE="WaEnhancer v${VERSION} (${SHORT_SHA})"
+            COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1 | sed 's/[<>&]//g')
+            BODY=$(printf "### 🚀 What's New in %s\n\n**Commit:** <code>%s</code>\n**Summary:** %s\n\n#### Recent Changes:\n%s\n\n---\n*Built in the public repo from the private source at [AltafYafai/WA-Pulse](https://github.com/AltafYafai/WA-Pulse)*" \
+              "${TITLE}" "${SHORT_SHA}" "${COMMIT_MSG}" "$(git log -5 --pretty=format:"* %s (%h)")")
+          fi
+
+          WA_APK=$(ls app/build/outputs/apk/whatsapp/debug/*.apk 2>/dev/null | head -n 1)
+          BIZ_APK=$(ls app/build/outputs/apk/business/debug/*.apk 2>/dev/null | head -n 1)
+
+          FILES=()
+          [ -f "$WA_APK" ] && FILES+=("$WA_APK")
+          [ -f "$BIZ_APK" ] && FILES+=("$BIZ_APK")
+
+          if [ ${#FILES[@]} -gt 0 ]; then
+            echo "Publishing release $TAG in ${{ github.repository }}..."
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "Release $TAG already exists, updating..."
+              gh release edit "$TAG" --title "$TITLE" --notes "$BODY" --latest
+              gh release upload "$TAG" "${FILES[@]}" --clobber
+            else
+              gh release create "$TAG" "${FILES[@]}" \
+                --title "$TITLE" \
+                --notes "$BODY" \
+                --latest
+            fi
+            echo "Successfully published release $TAG"
+          else
+            echo "No APKs found to upload."
+          fi
+
+      - name: Send APKs to Telegram
+        if: success()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo "Telegram credentials not set, skipping APK upload."
+            exit 0
+          fi
+
+          if [ -f /tmp/tg_msg_id ]; then
+            MSG_ID=$(cat /tmp/tg_msg_id)
+            COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1 | sed 's/[<>&]//g')
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            FINAL_TEXT=$(printf "%s\n" \
+              "🎉 <b>WaEnhancer Build Complete!</b>" \
+              "━━━━━━━━━━━━━━━━━━" \
+              "📌 <b>Commit:</b> <code>${SHORT_SHA}</code>" \
+              "💬 <b>Message:</b> ${COMMIT_MSG}" \
+              "" \
+              "<b>Status:</b>" \
+              "✅ [1/4] Environment & Android SDK Ready" \
+              "✅ [2/4] WhatsApp & Business APKs Compiled" \
+              "✅ [3/4] GitHub Artifacts Uploaded" \
+              "✅ [4/4] Sending APK files below ⬇️")
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/editMessageText" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "message_id=${MSG_ID}" \
+              --data-urlencode "text=${FINAL_TEXT}" \
+              --data-urlencode "parse_mode=HTML" > /dev/null || true
+          fi
+
+          COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          CAPTION="✅ <b>WaEnhancer Build Succeeded!</b>%0A%0A📌 <b>Commit:</b> <code>${SHORT_SHA}</code>%0A💬 <b>Message:</b> ${COMMIT_MSG}%0A🌿 <b>Branch:</b> <code>${{ steps.src.outputs.branch }}</code>"
+
+          for apk in app/build/outputs/apk/whatsapp/debug/*.apk; do
+            if [ -f "$apk" ]; then
+              echo "Uploading $apk to Telegram..."
+              curl -s -F chat_id="$CHAT_ID" \
+                   -F document=@"$apk" \
+                   -F caption="$CAPTION (WhatsApp)" \
+                   -F parse_mode="HTML" \
+                   https://api.telegram.org/bot$BOT_TOKEN/sendDocument
+            fi
+          done
+
+          for apk in app/build/outputs/apk/business/debug/*.apk; do
+            if [ -f "$apk" ]; then
+              echo "Uploading $apk to Telegram..."
+              curl -s -F chat_id="$CHAT_ID" \
+                   -F document=@"$apk" \
+                   -F caption="$CAPTION (Business)" \
+                   -F parse_mode="HTML" \
+                   https://api.telegram.org/bot$BOT_TOKEN/sendDocument
+            fi
+          done
+
+      - name: Send Failure & Error Log to Telegram
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo "Telegram credentials not set, skipping error alert."
+            exit 0
+          fi
+
+          if [ -f /tmp/tg_msg_id ]; then
+            MSG_ID=$(cat /tmp/tg_msg_id)
+            FAIL_TRACKER=$(printf "%s\n" \
+              "❌ <b>WaEnhancer Build Failed!</b>" \
+              "━━━━━━━━━━━━━━━━━━" \
+              "📌 <b>Commit:</b> <code>${{ github.event.client_payload.commit_sha || github.sha }}</code>" \
+              "⚠️ Build failed during compilation." \
+              "📄 Detailed error log sent below ⬇️")
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/editMessageText" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "message_id=${MSG_ID}" \
+              --data-urlencode "text=${FAIL_TRACKER}" \
+              --data-urlencode "parse_mode=HTML" > /dev/null || true
+          fi
+
+          FAIL_CAPTION="❌ <b>WaEnhancer Build Failed!</b>%0A%0A📌 <b>Commit:</b> <code>${{ github.event.client_payload.commit_sha || github.sha }}</code>%0A🌿 <b>Branch:</b> <code>${{ steps.src.outputs.branch }}</code>%0A🔗 <a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">View Run on GitHub</a>"
+
+          if [ -f error.log ]; then
+            echo "Uploading error.log to Telegram..."
+            curl -s -F chat_id="$CHAT_ID" \
+                 -F document=@"error.log" \
+                 -F caption="$FAIL_CAPTION" \
+                 -F parse_mode="HTML" \
+                 https://api.telegram.org/bot$BOT_TOKEN/sendDocument
+          else
+            curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+                 --data-urlencode "chat_id=${CHAT_ID}" \
+                 --data-urlencode "text=${FAIL_CAPTION}" \
+                 --data-urlencode "parse_mode=HTML"
+          fi
