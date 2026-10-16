@@ -24,7 +24,7 @@ This repository builds and publishes the APKs; the source of truth lives in the 
   version and the changelog, producing a release tagged `v<version>`.
 
 The private repo needs a `DISPATCH_TOKEN` secret (a PAT with write access here) to send the
-dispatch events.
+dispatch events (`RELEASE_TOKEN` also works).
 
 ### Required repository secrets
 
