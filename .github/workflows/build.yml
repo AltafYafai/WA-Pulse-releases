@@ -1,4 +1,4 @@
-name: Build APKs
+name: Build WA Pulse APKs
 
 # Builds are always executed here (public repo) from the private source repo.
 # The private repo only dispatches: it never runs Gradle.
@@ -11,6 +11,10 @@ on:
         description: 'Branch, tag or commit SHA of AltafYafai/WA-Pulse to build'
         required: false
         default: master
+      version_name:
+        description: 'Release version (e.g. 2.26.41.0); defaults to 1.0.0'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -26,7 +30,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build WaEnhancer APKs
+    name: Build WA Pulse APKs
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -36,18 +40,24 @@ jobs:
         env:
           PAYLOAD_SHA: ${{ github.event.client_payload.commit_sha }}
           PAYLOAD_BRANCH: ${{ github.event.client_payload.branch }}
+          PAYLOAD_VERSION: ${{ github.event.client_payload.version_name }}
           INPUT_REF: ${{ inputs.ref }}
+          INPUT_VERSION: ${{ inputs.version_name }}
         run: |
           REF="${PAYLOAD_SHA:-${INPUT_REF:-master}}"
           BRANCH="${PAYLOAD_BRANCH:-$REF}"
+          VERSION="${PAYLOAD_VERSION:-$INPUT_VERSION}"
+          VERSION="${VERSION#v}"
+          [ -z "$VERSION" ] && VERSION="1.0.0"
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-          echo "Building ${SOURCE_REPOSITORY} @ ${REF}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building ${SOURCE_REPOSITORY} @ ${REF} (version ${VERSION})"
 
       - name: Resolve source credentials
         id: cred
         env:
-          PAT: ${{ secrets.PAT || secrets.SOURCE_TOKEN || secrets.GH_PAT }}
+          PAT: ${{ secrets.SOURCE_REPO_TOKEN || secrets.PAT || secrets.SOURCE_TOKEN || secrets.GH_PAT }}
           SSH_KEY: ${{ secrets.SOURCE_SSH_KEY }}
         run: |
           if [ -n "$PAT" ]; then
@@ -57,7 +67,7 @@ jobs:
             echo "auth=ssh" >> "$GITHUB_OUTPUT"
             echo "No PAT secret found, falling back to the read-only deploy key."
           else
-            echo "::error::No source credential found. Add a repository secret named PAT with read access to ${SOURCE_REPOSITORY}."
+            echo "::error::No source credential found. Add a repository secret named SOURCE_REPO_TOKEN with read access to ${SOURCE_REPOSITORY}."
             exit 1
           fi
 
@@ -69,7 +79,7 @@ jobs:
           submodules: recursive
           fetch-depth: 0
           # Exactly one credential is passed so the auth mode is never ambiguous.
-          token: ${{ steps.cred.outputs.auth == 'token' && (secrets.PAT || secrets.SOURCE_TOKEN || secrets.GH_PAT) || github.token }}
+          token: ${{ steps.cred.outputs.auth == 'token' && (secrets.SOURCE_REPO_TOKEN || secrets.PAT || secrets.SOURCE_TOKEN || secrets.GH_PAT) || github.token }}
           ssh-key: ${{ steps.cred.outputs.auth == 'ssh' && secrets.SOURCE_SSH_KEY || '' }}
 
       - name: Send Initial Telegram Progress
@@ -81,7 +91,7 @@ jobs:
             COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1 | sed 's/[<>&]//g')
             SHORT_SHA=$(git rev-parse --short HEAD)
             TEXT=$(printf "%s\n" \
-              "🔨 <b>WaEnhancer Build Tracker</b>" \
+              "🔨 <b>WA Pulse Build Tracker</b>" \
               "━━━━━━━━━━━━━━━━━━" \
               "📌 <b>Commit:</b> <code>${SHORT_SHA}</code>" \
               "💬 <b>Message:</b> ${COMMIT_MSG}" \
@@ -142,6 +152,23 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
+      - name: Restore signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::Signing secrets are not configured. Add KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS and KEY_PASSWORD in Settings -> Secrets and variables -> Actions (see keystore/README.md in the source repo)."
+            exit 1
+          fi
+          mkdir -p keystore
+          echo "$KEYSTORE_BASE64" | base64 -d > keystore/release.jks
+          printf 'androidStoreFile=keystore/release.jks\nandroidStorePassword=%s\nandroidKeyAlias=%s\nandroidKeyPassword=%s\n' \
+            "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore/keystore.properties
+          echo "Keystore restored ($(wc -c < keystore/release.jks) bytes); APKs are signed with the release key."
+
       - name: Update Progress - Compiling APKs
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -152,7 +179,7 @@ jobs:
             COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1 | sed 's/[<>&]//g')
             SHORT_SHA=$(git rev-parse --short HEAD)
             TEXT=$(printf "%s\n" \
-              "🔨 <b>WaEnhancer Build Tracker</b>" \
+              "🔨 <b>WA Pulse Build Tracker</b>" \
               "━━━━━━━━━━━━━━━━━━" \
               "📌 <b>Commit:</b> <code>${SHORT_SHA}</code>" \
               "💬 <b>Message:</b> ${COMMIT_MSG}" \
@@ -174,7 +201,9 @@ jobs:
         id: build_apks
         run: |
           set -o pipefail
-          ./gradlew assembleWhatsappDebug assembleBusinessDebug -Pminify=true --stacktrace 2>&1 | tee build.log
+          ./gradlew assembleWhatsappDebug assembleBusinessDebug -Pminify=true \
+            -PversionName="${{ steps.src.outputs.version }}" \
+            --stacktrace 2>&1 | tee build.log
 
       - name: Check 16KB native lib alignment (Android 15+)
         if: success()
@@ -201,7 +230,7 @@ jobs:
             COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1 | sed 's/[<>&]//g')
             SHORT_SHA=$(git rev-parse --short HEAD)
             TEXT=$(printf "%s\n" \
-              "🔨 <b>WaEnhancer Build Tracker</b>" \
+              "🔨 <b>WA Pulse Build Tracker</b>" \
               "━━━━━━━━━━━━━━━━━━" \
               "📌 <b>Commit:</b> <code>${SHORT_SHA}</code>" \
               "💬 <b>Message:</b> ${COMMIT_MSG}" \
@@ -275,7 +304,7 @@ jobs:
           PAYLOAD_VERSION: ${{ github.event.client_payload.version_name }}
           PAYLOAD_NOTES: ${{ github.event.client_payload.release_notes }}
         run: |
-          VERSION=$(grep -oP 'versionName\s*=\s*"\K[^ "]+' app/build.gradle.kts | head -n 1)
+          VERSION="${{ steps.src.outputs.version }}"
           SHORT_SHA=$(git rev-parse --short=8 HEAD | tr '[:lower:]' '[:upper:]')
 
           if [ -n "$PAYLOAD_TAG" ]; then
@@ -284,7 +313,7 @@ jobs:
             BODY="${PAYLOAD_NOTES:-Automated release ${PAYLOAD_TAG}}"
           else
             TAG="v${VERSION}-${SHORT_SHA}"
-            TITLE="WaEnhancer v${VERSION} (${SHORT_SHA})"
+            TITLE="WA Pulse v${VERSION} (${SHORT_SHA})"
             COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1 | sed 's/[<>&]//g')
             BODY=$(printf "### 🚀 What's New in %s\n\n**Commit:** <code>%s</code>\n**Summary:** %s\n\n#### Recent Changes:\n%s\n\n---\n*Built in the public repo from the private source at [AltafYafai/WA-Pulse](https://github.com/AltafYafai/WA-Pulse)*" \
               "${TITLE}" "${SHORT_SHA}" "${COMMIT_MSG}" "$(git log -5 --pretty=format:"* %s (%h)")")
@@ -331,7 +360,7 @@ jobs:
             COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1 | sed 's/[<>&]//g')
             SHORT_SHA=$(git rev-parse --short HEAD)
             FINAL_TEXT=$(printf "%s\n" \
-              "🎉 <b>WaEnhancer Build Complete!</b>" \
+              "🎉 <b>WA Pulse Build Complete!</b>" \
               "━━━━━━━━━━━━━━━━━━" \
               "📌 <b>Commit:</b> <code>${SHORT_SHA}</code>" \
               "💬 <b>Message:</b> ${COMMIT_MSG}" \
@@ -350,7 +379,7 @@ jobs:
 
           COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1)
           SHORT_SHA=$(git rev-parse --short HEAD)
-          CAPTION="✅ <b>WaEnhancer Build Succeeded!</b>%0A%0A📌 <b>Commit:</b> <code>${SHORT_SHA}</code>%0A💬 <b>Message:</b> ${COMMIT_MSG}%0A🌿 <b>Branch:</b> <code>${{ steps.src.outputs.branch }}</code>"
+          CAPTION="✅ <b>WA Pulse Build Succeeded!</b>%0A%0A📌 <b>Commit:</b> <code>${SHORT_SHA}</code>%0A💬 <b>Message:</b> ${COMMIT_MSG}%0A🌿 <b>Branch:</b> <code>${{ steps.src.outputs.branch }}</code>"
 
           for apk in app/build/outputs/apk/whatsapp/debug/*.apk; do
             if [ -f "$apk" ]; then
@@ -388,7 +417,7 @@ jobs:
           if [ -f /tmp/tg_msg_id ]; then
             MSG_ID=$(cat /tmp/tg_msg_id)
             FAIL_TRACKER=$(printf "%s\n" \
-              "❌ <b>WaEnhancer Build Failed!</b>" \
+              "❌ <b>WA Pulse Build Failed!</b>" \
               "━━━━━━━━━━━━━━━━━━" \
               "📌 <b>Commit:</b> <code>${{ github.event.client_payload.commit_sha || github.sha }}</code>" \
               "⚠️ Build failed during compilation." \
@@ -400,7 +429,7 @@ jobs:
               --data-urlencode "parse_mode=HTML" > /dev/null || true
           fi
 
-          FAIL_CAPTION="❌ <b>WaEnhancer Build Failed!</b>%0A%0A📌 <b>Commit:</b> <code>${{ github.event.client_payload.commit_sha || github.sha }}</code>%0A🌿 <b>Branch:</b> <code>${{ steps.src.outputs.branch }}</code>%0A🔗 <a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">View Run on GitHub</a>"
+          FAIL_CAPTION="❌ <b>WA Pulse Build Failed!</b>%0A%0A📌 <b>Commit:</b> <code>${{ github.event.client_payload.commit_sha || github.sha }}</code>%0A🌿 <b>Branch:</b> <code>${{ steps.src.outputs.branch }}</code>%0A🔗 <a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">View Run on GitHub</a>"
 
           if [ -f error.log ]; then
             echo "Uploading error.log to Telegram..."

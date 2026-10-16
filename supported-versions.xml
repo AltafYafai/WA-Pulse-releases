@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  OTA supported WhatsApp versions for WA Pulse.
+  Fetched at runtime by UpdateChecker (com.wmods.wppenhacer.UpdateChecker) from
+  https://raw.githubusercontent.com/AltafYafai/WA-Pulse-releases/main/supported-versions.xml
+  Add future versions as <item>2.xx.yy.xx</item> entries - no app update needed.
+-->
+<resources>
+    <string-array name="supported_versions_wpp">
+        <item>2.26.25.xx</item>
+        <item>2.26.26.xx</item>
+        <item>2.26.27.xx</item>
+        <item>2.26.28.xx</item>
+        <item>2.26.29.xx</item>
+        <item>2.26.30.xx</item>
+        <item>2.26.31.xx</item>
+        <item>2.26.32.xx</item>
+        <item>2.26.33.xx</item>
+        <item>2.26.34.xx</item>
+        <item>2.26.35.xx</item>
+        <item>2.26.36.xx</item>
+        <item>2.26.37.xx</item>
+        <item>2.26.38.xx</item>
+        <item>2.26.39.xx</item>
+        <item>2.26.40.xx</item>
+        <item>2.26.41.xx</item>
+        <item>2.26.42.xx</item>
+        <item>2.26.43.xx</item>
+        <item>2.26.44.xx</item>
+        <item>2.26.45.xx</item>
+        <item>2.26.46.xx</item>
+        <item>2.26.47.xx</item>
+        <item>2.26.48.xx</item>
+        <item>2.26.49.xx</item>
+        <item>2.26.50.xx</item>
+        <item>2.27.10.xx</item>
+        <item>2.27.11.xx</item>
+        <item>2.27.12.xx</item>
+        <item>2.27.13.xx</item>
+        <item>2.27.14.xx</item>
+        <item>2.27.15.xx</item>
+        <item>2.27.20.xx</item>
+        <item>2.27.21.xx</item>
+        <item>2.27.25.xx</item>
+        <item>2.28.0.xx</item>
+        <item>2.28.5.xx</item>
+        <item>2.28.10.xx</item>
+        <item>2.29.0.xx</item>
+    </string-array>
+
+    <string-array name="supported_versions_business">
+        <item>2.26.25.xx</item>
+        <item>2.26.26.xx</item>
+        <item>2.26.27.xx</item>
+        <item>2.26.28.xx</item>
+        <item>2.26.29.xx</item>
+        <item>2.26.30.xx</item>
+        <item>2.26.31.xx</item>
+        <item>2.26.32.xx</item>
+        <item>2.26.33.xx</item>
+        <item>2.26.34.xx</item>
+        <item>2.26.35.xx</item>
+        <item>2.26.36.xx</item>
+        <item>2.26.37.xx</item>
+        <item>2.26.38.xx</item>
+        <item>2.26.39.xx</item>
+        <item>2.26.40.xx</item>
+        <item>2.26.41.xx</item>
+        <item>2.26.42.xx</item>
+        <item>2.26.43.xx</item>
+        <item>2.26.44.xx</item>
+        <item>2.26.45.xx</item>
+        <item>2.26.46.xx</item>
+        <item>2.26.47.xx</item>
+        <item>2.26.48.xx</item>
+        <item>2.26.49.xx</item>
+        <item>2.26.50.xx</item>
+        <item>2.27.10.xx</item>
+        <item>2.27.11.xx</item>
+        <item>2.27.12.xx</item>
+        <item>2.27.13.xx</item>
+        <item>2.27.14.xx</item>
+        <item>2.27.15.xx</item>
+        <item>2.27.20.xx</item>
+        <item>2.27.21.xx</item>
+        <item>2.27.25.xx</item>
+        <item>2.28.0.xx</item>
+        <item>2.28.5.xx</item>
+        <item>2.28.10.xx</item>
+        <item>2.29.0.xx</item>
+    </string-array>
+</resources>
